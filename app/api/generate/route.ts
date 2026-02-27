@@ -16,7 +16,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'No API key configured' }, { status: 500 });
     }
 
-    // Collect reference images
+    // Collect reference images as base64
     const referenceImages: { mimeType: string; data: string }[] = [];
     for (let i = 0; i < 5; i++) {
       const ref = formData.get(`ref_${i}`) as File | null;
@@ -30,36 +30,30 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // Build the prompt
-    const imagePrompt = `Create a storyboard panel illustration. 
+    // Build the image generation prompt
+    const imagePrompt = `Generate a storyboard panel illustration.
+
 Style: ${stylePrompt}
 
 Scene: ${scene.title}
-Visual description: ${scene.description}
-${scene.vo ? `Dialogue/VO: "${scene.vo}"` : ''}
+Visual: ${scene.description}
+${scene.vo ? `Dialogue: "${scene.vo}"` : ''}
 
-Requirements:
-- Professional storyboard panel
-- Clean composition
-- Include label at bottom: "SCENE ${parseInt(sceneIndex) + 1} - ${scene.title.toUpperCase()}"
-${referenceImages.length > 0 ? '- Use the character from the reference images provided, maintaining exact same appearance' : ''}
+Create a professional storyboard panel with label "SCENE ${parseInt(sceneIndex) + 1} - ${scene.title.toUpperCase()}" at the bottom.
+${referenceImages.length > 0 ? 'Use the exact character from the reference images.' : ''}`;
 
-Generate a single high-quality storyboard panel image.`;
-
-    // Build request parts
+    // Build request parts for Gemini 2.0 Flash with image generation
     const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [];
     
-    // Add reference images first
+    // Add reference images
     for (const img of referenceImages) {
-      parts.push({
-        inlineData: img,
-      });
+      parts.push({ inlineData: img });
     }
     
-    // Add text prompt
+    // Add prompt
     parts.push({ text: imagePrompt });
 
-    // Call Gemini image generation (Imagen 3 via Gemini)
+    // Try Gemini 2.0 Flash Experimental (supports image generation)
     const response = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${apiKey}`,
       {
@@ -68,37 +62,19 @@ Generate a single high-quality storyboard panel image.`;
         body: JSON.stringify({
           contents: [{ parts }],
           generationConfig: {
-            temperature: 0.8,
-            maxOutputTokens: 8192,
+            responseModalities: ["TEXT", "IMAGE"],
           },
-          safetySettings: [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-          ],
         }),
       }
     );
 
     const data = await response.json();
+    console.log('Gemini response:', JSON.stringify(data, null, 2).substring(0, 1000));
     
-    // Check for errors
-    if (data.error) {
-      console.error('Gemini API error:', JSON.stringify(data.error, null, 2));
-      return NextResponse.json({ 
-        error: 'Gemini API error',
-        details: data.error.message || 'Unknown error'
-      }, { status: 500 });
-    }
-
-    // Extract image from response (if using imagen model)
-    const candidates = data.candidates || [];
-    for (const candidate of candidates) {
-      const parts = candidate.content?.parts || [];
-      for (const part of parts) {
+    // Check for image in response
+    if (data.candidates?.[0]?.content?.parts) {
+      for (const part of data.candidates[0].content.parts) {
         if (part.inlineData?.data) {
-          // Save image to public directory
           const publicDir = path.join(process.cwd(), 'public', 'generated');
           await mkdir(publicDir, { recursive: true });
           
@@ -116,58 +92,26 @@ Generate a single high-quality storyboard panel image.`;
       }
     }
 
-    // If Gemini Flash doesn't return image, use external image generation
-    // Fallback: Use Gemini to create a detailed prompt and generate placeholder
-    const textResponse = candidates[0]?.content?.parts?.[0]?.text;
-    
-    // Try using the dedicated image generation endpoint
-    const imageGenResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          instances: [{ prompt: imagePrompt }],
-          parameters: {
-            sampleCount: 1,
-            aspectRatio: "16:9",
-            safetyFilterLevel: "block_few",
-            personGeneration: "allow_adult",
-          },
-        }),
-      }
-    );
-
-    const imageGenData = await imageGenResponse.json();
-    
-    if (imageGenData.predictions?.[0]?.bytesBase64Encoded) {
-      const publicDir = path.join(process.cwd(), 'public', 'generated');
-      await mkdir(publicDir, { recursive: true });
-      
-      const filename = `panel-${sceneIndex}-${Date.now()}.png`;
-      const filepath = path.join(publicDir, filename);
-      
-      const imageBuffer = Buffer.from(imageGenData.predictions[0].bytesBase64Encoded, 'base64');
-      await writeFile(filepath, imageBuffer);
-      
+    // Check for error
+    if (data.error) {
+      console.error('Gemini error:', data.error);
       return NextResponse.json({ 
-        imageUrl: `/generated/${filename}`,
-        success: true 
-      });
+        error: data.error.message || 'API error',
+        details: 'Gemini image generation failed'
+      }, { status: 500 });
     }
 
-    // Final fallback: return error with details
-    console.error('No image generated:', JSON.stringify({ data, imageGenData }, null, 2));
+    // No image generated
     return NextResponse.json({ 
-      error: 'Image generation not available',
-      details: 'The model did not return an image. Try using a different style or simplifying the prompt.',
-      textResponse,
+      error: 'No image generated',
+      details: 'The API did not return an image. This model may not support image generation.',
+      debug: data.candidates?.[0]?.content?.parts?.[0]?.text?.substring(0, 200)
     }, { status: 500 });
     
   } catch (error) {
     console.error('Generate error:', error);
     return NextResponse.json({ 
-      error: 'Failed to generate image',
+      error: 'Generation failed',
       details: String(error)
     }, { status: 500 });
   }
